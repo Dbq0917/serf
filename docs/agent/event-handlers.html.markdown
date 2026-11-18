@@ -19,6 +19,27 @@ as `awk '{print $2}' | grep foo`), since event handlers are invoked within
 the context of a shell. The event handler is executed anytime an event
 occurs and is expected to exit within a reasonable amount of time.
 
+## Event Delivery Reliability
+
+Serf feeds events to handlers through a bounded internal buffer so that a
+slow handler cannot stall the membership protocol. During a bulk membership
+change, when events are produced tens of times faster than usual, the
+behavior depends on the event kind:
+
+* Critical membership events (`member-leave`, `member-failed`, and
+  `member-reap`) drive resource cleanup and are **never silently dropped**.
+  When the buffer is full Serf applies backpressure until the handler catches
+  up, so every cleanup-triggering event is still delivered.
+* Best-effort events (`member-join`, `member-update`, `user`, and `query`)
+  are **dropped** when the buffer is full, and each drop is counted and
+  logged. The drop counters surface through the
+  [`serf.events.dropped` telemetry](/docs/agent/telemetry.html) metric and,
+  for embedded use, the `Serf.EventDropStats()` method.
+
+This keeps the existing event types and handler contract unchanged while
+making overload observable and preventing cleanup logic from leaking
+resources.
+
 ## Inputs and Parameters
 
 Every time an event handler is invoked, Serf sets some environmental

@@ -2,6 +2,7 @@
 
 IMPROVEMENTS:
 * ValidateNodeName flag can now restrict node names to alphanumeric, -, and . while also keeping node names under 128 characters. Verification of IP Address and tags occur for messages. [GH-612](https://github.com/hashicorp/serf/pull/612)
+* Event delivery now degrades gracefully when the event channel is saturated by a bulk membership change. The application-facing event channel is wrapped in a bounded dispatcher: best-effort events (join/update/user/query) are dropped and counted instead of stalling Serf, while critical member `leave`/`failed`/`reap` events that drive downstream cleanup apply backpressure and are never silently dropped. New counters are available at runtime via `Serf.EventDropStats()` and through the `serf.events.dropped`, `serf.events.critical_backpressure`, `serf.events.critical_abandoned`, and `serf.events.queue_depth` metrics. The existing `Event` interface and channel semantics are unchanged.
 
 ## 0.8.4 (September 19, 2019)
 

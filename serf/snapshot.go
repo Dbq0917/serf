@@ -65,6 +65,7 @@ type Snapshotter struct {
 	clock                   *LamportClock
 	fh                      *os.File
 	buffered                *bufio.Writer
+	dispatcher              *eventDispatcher
 	inCh                    <-chan Event
 	streamCh                chan Event
 	lastFlush               time.Time
@@ -77,7 +78,6 @@ type Snapshotter struct {
 	minCompactSize          int64
 	path                    string
 	offset                  int64
-	outCh                   chan<- Event
 	rejoinAfterLeave        bool
 	shutdownCh              <-chan struct{}
 	waitCh                  chan struct{}
@@ -125,12 +125,23 @@ func NewSnapshotter(path string,
 	}
 	offset := info.Size()
 
+	// Degrade gracefully when the application facing event channel is
+	// saturated: non-critical events are dropped and counted, critical
+	// member leave/failed/reap events are preserved via backpressure
+	// instead of being silently lost as the previous non-blocking send did.
+	var dispatcher *eventDispatcher
+	if outCh != nil {
+		dispatcher = newEventDispatcher(outCh, shutdownCh, eventChSize,
+			logger, nil, "snapshot")
+	}
+
 	// Create the snapshotter
 	snap := &Snapshotter{
 		aliveNodes:       make(map[string]string),
 		clock:            clock,
 		fh:               fh,
 		buffered:         bufio.NewWriter(fh),
+		dispatcher:       dispatcher,
 		inCh:             inCh,
 		streamCh:         streamCh,
 		lastClock:        0,
@@ -141,7 +152,6 @@ func NewSnapshotter(path string,
 		minCompactSize:   int64(minCompactSize),
 		path:             path,
 		offset:           offset,
-		outCh:            outCh,
 		rejoinAfterLeave: rejoinAfterLeave,
 		shutdownCh:       shutdownCh,
 		waitCh:           make(chan struct{}),
@@ -153,7 +163,10 @@ func NewSnapshotter(path string,
 		return nil, nil, err
 	}
 
-	// Start handling new commands
+	// Start handling new commands. A single tee fans each event out to the
+	// on-disk snapshot stream and the application-facing dispatcher. The
+	// two fan-outs use independent bounded buffers so a stalled consumer
+	// cannot block snapshot bookkeeping (and vice versa).
 	go snap.teeStream()
 	go snap.stream()
 	return inCh, snap, nil
@@ -204,22 +217,35 @@ func (s *Snapshotter) Leave() {
 	}
 }
 
-// teeStream is a long running routine that is used to copy events
-// to the output channel and the internal event handler.
+// teeStream is a long running routine that fans every ingested event out
+// to two independent sinks: the on-disk snapshot stream and the
+// application-facing dispatcher. Each fan-out applies its own degradation
+// policy, and neither can block the other.
 func (s *Snapshotter) teeStream() {
-	flushEvent := func(e Event) {
-		// Forward to the internal stream, do not block
-		select {
-		case s.streamCh <- e:
-		default:
+	forward := func(e Event) {
+		// Persistence path: critical events drive the alive/not-alive
+		// bookkeeping used to re-join after restart, so they apply
+		// backpressure; best-effort events are dropped and counted.
+		if isCriticalEvent(e) {
+			select {
+			case s.streamCh <- e:
+			case <-s.shutdownCh:
+				return
+			}
+		} else {
+			select {
+			case s.streamCh <- e:
+			default:
+				if s.dispatcher != nil {
+					s.dispatcher.recordSnapshotDrop(e)
+				}
+			}
 		}
 
-		// Forward the event immediately, do not block
-		if s.outCh != nil {
-			select {
-			case s.outCh <- e:
-			default:
-			}
+		// Application path: the bounded dispatcher drops best-effort
+		// events (counted) but never silently drops critical events.
+		if s.dispatcher != nil {
+			s.dispatcher.dispatch(e)
 		}
 	}
 
@@ -227,20 +253,40 @@ OUTER:
 	for {
 		select {
 		case e := <-s.inCh:
-			flushEvent(e)
+			forward(e)
 		case <-s.shutdownCh:
 			break OUTER
 		}
 	}
 
-	// Drain any remaining events before exiting
+	// Drain any remaining events before exiting.
 	for {
 		select {
 		case e := <-s.inCh:
-			flushEvent(e)
+			forward(e)
 		default:
 			return
 		}
+	}
+}
+
+// DropStats returns cumulative counters for events that were dropped while
+// forwarding from the snapshotter, both toward the application event
+// channel and toward the on-disk snapshot stream.
+func (s *Snapshotter) DropStats() EventDropStats {
+	if s.dispatcher == nil {
+		return EventDropStats{DroppedByType: map[string]uint64{}}
+	}
+	return s.dispatcher.DropStats()
+}
+
+// setMetricLabels propagates the Serf-level metric labels to the internal
+// dispatcher. It is invoked once during Serf creation, before any event
+// can flow through the snapshotter.
+func (s *Snapshotter) setMetricLabels(labels []metrics.Label) {
+	s.metricLabels = labels
+	if s.dispatcher != nil {
+		s.dispatcher.labels = labels
 	}
 }
 

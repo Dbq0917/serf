@@ -40,3 +40,32 @@ Below is an example output:
 [2014-01-29 10:56:50 -0800 PST][S] 'serf-agent.serf.queue.Event': Count: 10 Min: 0.000 Mean: 2.500 Max: 5.000 Stddev: 2.121 Sum: 25.000
 ```
 
+## Event Delivery Degradation Metrics
+
+Serf wraps the application-facing event channel in a bounded buffer so that a
+slow consumer cannot stall internal state updates. When a bulk membership
+change produces events faster than they can be consumed, Serf degrades
+gracefully and reports the degradation through the following metrics. A
+sudden increase in the drop counter is the signal that someone is performing
+a bulk change that the event consumer cannot keep up with.
+
+* `serf.events.dropped` (counter): number of best-effort events
+  (`member-join`, `member-update`, user events, queries) dropped because the
+  bounded event channel was full. Emitted with an `event_type` label naming
+  the event and a `stage` label (`consumer` for the application channel,
+  `snapshot` for the on-disk snapshot stream). Critical `member-leave`,
+  `member-failed`, and `member-reap` events are never counted here.
+* `serf.events.critical_backpressure` (counter): number of times a critical
+  event found the buffer full and had to wait for capacity. Critical events
+  drive downstream resource cleanup, so Serf applies backpressure rather than
+  dropping them.
+* `serf.events.critical_abandoned` (counter): number of critical events that
+  could not be delivered because Serf shut down while waiting for capacity.
+* `serf.events.queue_depth` (sample): the bounded event channel depth sampled
+  whenever an event is dropped, allowing drop spikes to be correlated with
+  buffer saturation.
+
+The same counters are available in-process through
+`Serf.EventDropStats()`, and through `Snapshotter.DropStats()` when a
+snapshot is configured, for tests and auditable verification.
+

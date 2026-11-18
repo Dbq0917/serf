@@ -84,6 +84,7 @@ type Serf struct {
 	eventJoinIgnore atomic.Value
 	eventMinTime    LamportTime
 	eventLock       sync.RWMutex
+	eventDispatcher *eventDispatcher
 
 	queryBroadcasts *memberlist.TransmitLimitedQueue
 	queryBuffer     []*queries
@@ -241,6 +242,12 @@ const (
 // or modified by the caller.
 func Create(conf *Config) (*Serf, error) {
 	conf.Init()
+	// Remember whether the caller actually supplied an event channel. The
+	// internal pipeline components allocate their own channels even when
+	// the caller did not, so checking conf.EventCh later cannot distinguish
+	// the two. The bounded dispatcher is only installed on behalf of a real
+	// consumer.
+	userEventCh := conf.EventCh
 	if conf.ProtocolVersion < ProtocolVersionMin {
 		return nil, fmt.Errorf("Protocol version '%d' too low. Must be in range: [%d, %d]",
 			conf.ProtocolVersion, ProtocolVersionMin, ProtocolVersionMax)
@@ -337,7 +344,7 @@ func Create(conf *Config) (*Serf, error) {
 		if err != nil {
 			return nil, fmt.Errorf("Failed to setup snapshot: %v", err)
 		}
-		snap.metricLabels = serf.metricLabels
+		snap.setMetricLabels(serf.metricLabels)
 		serf.snapshotter = snap
 		conf.EventCh = eventCh
 		prev = snap.AliveNodes()
@@ -346,6 +353,18 @@ func Create(conf *Config) (*Serf, error) {
 		oldQueryClock = snap.LastQueryClock()
 		serf.eventMinTime = oldEventClock + 1
 		serf.queryMinTime = oldQueryClock + 1
+	}
+
+	// Wrap the final pipeline channel in a bounded dispatcher, but only when
+	// the caller supplied a real EventCh. This ensures a slow consumer
+	// cannot stall Serf state updates: best-effort events are dropped (and
+	// counted via serf.events.dropped) when the buffer is full, while
+	// critical member leave/failed/reap events apply backpressure and are
+	// never silently dropped.
+	if userEventCh != nil {
+		serf.eventDispatcher = newEventDispatcher(conf.EventCh, serf.shutdownCh,
+			defaultEventChSize, serf.logger, serf.metricLabels, "serf")
+		conf.EventCh = serf.eventDispatcher.inputCh()
 	}
 
 	// Set up the coordinate cache. We do this after we read the snapshot to
@@ -922,6 +941,35 @@ func (s *Serf) broadcast(t messageType, msg any, notify chan<- struct{}) error {
 	return nil
 }
 
+// dispatchEvent hands an event to the event pipeline. When an application
+// supplied EventCh is configured it goes through the bounded dispatcher,
+// which degrades gracefully (drops with counters for best-effort events,
+// backpressure for critical events) instead of silently losing events.
+// When no dispatcher is installed (the caller did not supply an EventCh),
+// the internal pipeline may still own a channel that must receive the
+// event, so we send to it directly to preserve the original semantics.
+func (s *Serf) dispatchEvent(event Event) {
+	if s.eventDispatcher != nil {
+		s.eventDispatcher.dispatch(event)
+		return
+	}
+	if s.config.EventCh != nil {
+		s.config.EventCh <- event
+	}
+}
+
+// EventDropStats returns cumulative counters describing event delivery
+// degradation since this Serf instance was created: dropped non-critical
+// events (total and per type), delivered and backpressured critical
+// events. A rising drop count is the signal that a bulk change is
+// overwhelming the event consumer.
+func (s *Serf) EventDropStats() EventDropStats {
+	if s.eventDispatcher == nil {
+		return EventDropStats{DroppedByType: map[string]uint64{}}
+	}
+	return s.eventDispatcher.DropStats()
+}
+
 // handleNodeJoin is called when a node join event is received
 // from memberlist.
 func (s *Serf) handleNodeJoin(n *memberlist.Node) {
@@ -994,12 +1042,10 @@ func (s *Serf) handleNodeJoin(n *memberlist.Node) {
 	// Send an event along
 	s.logger.Printf("[INFO] serf: EventMemberJoin: %s %s",
 		member.Name, member.Addr)
-	if s.config.EventCh != nil {
-		s.config.EventCh <- MemberEvent{
-			Type:    EventMemberJoin,
-			Members: []Member{member.Member},
-		}
-	}
+	s.dispatchEvent(MemberEvent{
+		Type:    EventMemberJoin,
+		Members: []Member{member.Member},
+	})
 }
 
 // handleNodeLeave is called when a node leave event is received
@@ -1043,12 +1089,10 @@ func (s *Serf) handleNodeLeave(n *memberlist.Node) {
 
 	s.logger.Printf("[INFO] serf: %s: %s %s",
 		eventStr, member.Name, member.Addr)
-	if s.config.EventCh != nil {
-		s.config.EventCh <- MemberEvent{
-			Type:    event,
-			Members: []Member{member.Member},
-		}
-	}
+	s.dispatchEvent(MemberEvent{
+		Type:    event,
+		Members: []Member{member.Member},
+	})
 }
 
 // handleNodeUpdate is called when a node meta data update
@@ -1087,12 +1131,10 @@ func (s *Serf) handleNodeUpdate(n *memberlist.Node) {
 
 	// Send an event along
 	s.logger.Printf("[INFO] serf: EventMemberUpdate: %s", member.Name)
-	if s.config.EventCh != nil {
-		s.config.EventCh <- MemberEvent{
-			Type:    EventMemberUpdate,
-			Members: []Member{member.Member},
-		}
-	}
+	s.dispatchEvent(MemberEvent{
+		Type:    EventMemberUpdate,
+		Members: []Member{member.Member},
+	})
 }
 
 // handleNodeLeaveIntent is called when an intent to leave is received.
@@ -1165,12 +1207,10 @@ func (s *Serf) handleNodeLeaveIntent(leaveMsg *messageLeave) bool {
 		// graceful leave.
 		s.logger.Printf("[INFO] serf: EventMemberLeave (forced): %s %s",
 			member.Name, member.Addr)
-		if s.config.EventCh != nil {
-			s.config.EventCh <- MemberEvent{
-				Type:    EventMemberLeave,
-				Members: []Member{member.Member},
-			}
-		}
+		s.dispatchEvent(MemberEvent{
+			Type:    EventMemberLeave,
+			Members: []Member{member.Member},
+		})
 
 		if leaveMsg.Prune {
 			s.handlePrune(member)
@@ -1301,14 +1341,12 @@ func (s *Serf) handleUserEvent(eventMsg *messageUserEvent) bool {
 	metrics.IncrCounterWithLabels([]string{"serf", "events"}, 1, s.metricLabels)
 	metrics.IncrCounterWithLabels([]string{"serf", "events", eventMsg.Name}, 1, s.metricLabels)
 
-	if s.config.EventCh != nil {
-		s.config.EventCh <- UserEvent{
-			LTime:    eventMsg.LTime,
-			Name:     eventMsg.Name,
-			Payload:  eventMsg.Payload,
-			Coalesce: eventMsg.CC,
-		}
-	}
+	s.dispatchEvent(UserEvent{
+		LTime:    eventMsg.LTime,
+		Name:     eventMsg.Name,
+		Payload:  eventMsg.Payload,
+		Coalesce: eventMsg.CC,
+	})
 	return true
 }
 
@@ -1394,20 +1432,18 @@ func (s *Serf) handleQuery(query *messageQuery) bool {
 		}
 	}
 
-	if s.config.EventCh != nil {
-		s.config.EventCh <- &Query{
-			LTime:       query.LTime,
-			Name:        query.Name,
-			Payload:     query.Payload,
-			serf:        s,
-			id:          query.ID,
-			addr:        query.Addr,
-			port:        query.Port,
-			sourceNode:  query.SourceNode,
-			deadline:    time.Now().Add(query.Timeout),
-			relayFactor: query.RelayFactor,
-		}
-	}
+	s.dispatchEvent(&Query{
+		LTime:       query.LTime,
+		Name:        query.Name,
+		Payload:     query.Payload,
+		serf:        s,
+		id:          query.ID,
+		addr:        query.Addr,
+		port:        query.Port,
+		sourceNode:  query.SourceNode,
+		deadline:    time.Now().Add(query.Timeout),
+		relayFactor: query.RelayFactor,
+	})
 	return rebroadcast
 }
 
@@ -1556,12 +1592,10 @@ func (s *Serf) eraseNode(m *memberState) {
 	}
 
 	// Send an event along
-	if s.config.EventCh != nil {
-		s.config.EventCh <- MemberEvent{
-			Type:    EventMemberReap,
-			Members: []Member{m.Member},
-		}
-	}
+	s.dispatchEvent(MemberEvent{
+		Type:    EventMemberReap,
+		Members: []Member{m.Member},
+	})
 }
 
 // handleReap periodically reaps the list of failed and left members, as well
