@@ -2236,7 +2236,7 @@ func TestSerf_Query_Deduplicate(t *testing.T) {
 		Timeout: time.Second,
 		Flags:   queryFlagAck,
 	}
-	query := newQueryResponse(3, mq)
+	query := newQueryResponse(3, mq, nil, nil)
 	response := &messageQueryResponse{
 		LTime: mq.LTime,
 		ID:    mq.ID,

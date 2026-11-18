@@ -6,11 +6,13 @@ package serf
 import (
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"math/rand"
 	"net"
 	"regexp"
 	"slices"
+	"sort"
 	"sync"
 	"time"
 
@@ -95,6 +97,14 @@ type QueryResponse struct {
 	// ackCh is used to send the name of a node for which we've received an ack
 	ackCh chan string
 
+	// startedAt is the time the query was initiated, used to measure the
+	// per-node response latency.
+	startedAt time.Time
+
+	// closedAt is the time the query was closed, either by its timeout or
+	// an explicit Close. It is zero until the query is finished.
+	closedAt time.Time
+
 	// deadline is the query end time (start + query timeout)
 	deadline time.Time
 
@@ -111,18 +121,57 @@ type QueryResponse struct {
 	acks      map[string]struct{}
 	responses map[string]struct{}
 
+	// expectedNodes is the snapshot of cluster members that were expected
+	// to answer the query at the time it was dispatched. It lets callers
+	// tell which nodes never replied once the query finishes.
+	expectedNodes []string
+
+	// timings records the per-node ack/response latency measured from the
+	// start of the query.
+	timings map[string]*NodeTiming
+
+	// logger is used to emit an auditable summary when the query closes.
+	logger *log.Logger
+
 	closed    bool
 	closeLock sync.Mutex
 }
 
+// NodeTiming captures the response timings of a single node for a query.
+// AckLatency and ResponseLatency are zero when the node did not send the
+// corresponding reply, in which case Acked/Responded are false.
+type NodeTiming struct {
+	// Node is the name of the member the timings belong to.
+	Node string
+
+	// Acked reports whether the node acknowledged the query.
+	Acked bool
+
+	// AckLatency is the elapsed time between the start of the query and
+	// the receipt of the node's ack.
+	AckLatency time.Duration
+
+	// Responded reports whether the node sent a query response.
+	Responded bool
+
+	// ResponseLatency is the elapsed time between the start of the query
+	// and the receipt of the node's response.
+	ResponseLatency time.Duration
+}
+
 // newQueryResponse is used to construct a new query response
-func newQueryResponse(n int, q *messageQuery) *QueryResponse {
+func newQueryResponse(n int, q *messageQuery, expectedNodes []string, logger *log.Logger) *QueryResponse {
+	now := time.Now()
 	resp := &QueryResponse{
-		deadline:  time.Now().Add(q.Timeout),
-		id:        q.ID,
-		lTime:     q.LTime,
-		respCh:    make(chan NodeResponse, n),
-		responses: make(map[string]struct{}),
+		deadline:      now.Add(q.Timeout),
+		startedAt:     now,
+		id:            q.ID,
+		lTime:         q.LTime,
+		respCh:        make(chan NodeResponse, n),
+		responses:     make(map[string]struct{}),
+		expectedNodes: append([]string(nil), expectedNodes...),
+		timings:       make(map[string]*NodeTiming, n),
+		logger:        logger,
 	}
 	if q.Ack() {
 		resp.ackCh = make(chan string, n)
@@ -140,12 +189,14 @@ func (r *QueryResponse) Close() {
 		return
 	}
 	r.closed = true
+	r.closedAt = time.Now()
 	if r.ackCh != nil {
 		close(r.ackCh)
 	}
 	if r.respCh != nil {
 		close(r.respCh)
 	}
+	r.logSummary()
 }
 
 // Deadline returns the ending deadline of the query
@@ -158,6 +209,74 @@ func (r *QueryResponse) Finished() bool {
 	r.closeLock.Lock()
 	defer r.closeLock.Unlock()
 	return r.closed || time.Now().After(r.deadline)
+}
+
+// ExpectedNodes returns the snapshot of member names that were expected to
+// answer the query at dispatch time. The returned slice is safe to retain.
+func (r *QueryResponse) ExpectedNodes() []string {
+	r.closeLock.Lock()
+	defer r.closeLock.Unlock()
+	return append([]string(nil), r.expectedNodes...)
+}
+
+// MissingNodes returns the names of the expected nodes from which no query
+// response was received before the query finished. For ack-only queries
+// (RequestAck without any response), nodes that acknowledged are not
+// considered missing. The result is sorted and safe to retain.
+func (r *QueryResponse) MissingNodes() []string {
+	r.closeLock.Lock()
+	defer r.closeLock.Unlock()
+	return r.missingNodesLocked()
+}
+
+// missingNodesLocked computes the missing node names. The caller must hold
+// closeLock.
+func (r *QueryResponse) missingNodesLocked() []string {
+	ackOnly := r.ackCh != nil && len(r.responses) == 0
+	missing := make([]string, 0)
+	for _, node := range r.expectedNodes {
+		if _, ok := r.responses[node]; ok {
+			continue
+		}
+		if ackOnly {
+			if _, ok := r.acks[node]; ok {
+				continue
+			}
+		}
+		missing = append(missing, node)
+	}
+	sort.Strings(missing)
+	return missing
+}
+
+// NodeTimings returns the per-node ack/response latency measured from the
+// start of the query. It includes every node that replied, even if that
+// node joined after the query was dispatched and is not in ExpectedNodes.
+// The result is sorted by node name and safe to retain.
+func (r *QueryResponse) NodeTimings() []NodeTiming {
+	r.closeLock.Lock()
+	defer r.closeLock.Unlock()
+
+	timings := make([]NodeTiming, 0, len(r.timings))
+	for _, timing := range r.timings {
+		timings = append(timings, *timing)
+	}
+	sort.Slice(timings, func(i, j int) bool {
+		return timings[i].Node < timings[j].Node
+	})
+	return timings
+}
+
+// Elapsed returns the total wall-clock duration the query ran. It is zero
+// until the query is finished, after which it is the time between dispatch
+// and Close.
+func (r *QueryResponse) Elapsed() time.Duration {
+	r.closeLock.Lock()
+	defer r.closeLock.Unlock()
+	if r.closedAt.IsZero() {
+		return 0
+	}
+	return r.closedAt.Sub(r.startedAt)
 }
 
 // AckCh returns a channel that can be used to listen for acks
@@ -173,6 +292,17 @@ func (r *QueryResponse) ResponseCh() <-chan NodeResponse {
 	return r.respCh
 }
 
+// timingFor returns the NodeTiming tracked for the node, creating it on
+// first reply. The caller must hold closeLock.
+func (r *QueryResponse) timingFor(node string) *NodeTiming {
+	timing, ok := r.timings[node]
+	if !ok {
+		timing = &NodeTiming{Node: node}
+		r.timings[node] = timing
+	}
+	return timing
+}
+
 // sendResponse sends a response on the response channel ensuring the channel is not closed.
 func (r *QueryResponse) sendResponse(nr NodeResponse) error {
 	r.closeLock.Lock()
@@ -183,6 +313,9 @@ func (r *QueryResponse) sendResponse(nr NodeResponse) error {
 	select {
 	case r.respCh <- nr:
 		r.responses[nr.From] = struct{}{}
+		timing := r.timingFor(nr.From)
+		timing.Responded = true
+		timing.ResponseLatency = time.Since(r.startedAt)
 	default:
 		return errors.New("serf: Failed to deliver query response, dropping")
 	}
@@ -199,10 +332,37 @@ func (r *QueryResponse) sendAck(nr *messageQueryResponse) error {
 	select {
 	case r.ackCh <- nr.From:
 		r.acks[nr.From] = struct{}{}
+		timing := r.timingFor(nr.From)
+		timing.Acked = true
+		timing.AckLatency = time.Since(r.startedAt)
 	default:
 		return errors.New("serf: Failed to deliver query response, dropping")
 	}
 	return nil
+}
+
+// logSummary emits an auditable record of how the query completed, including
+// the expected/answered counts, the names of nodes that never replied, and
+// the per-node response latency so slow members can be identified.
+func (r *QueryResponse) logSummary() {
+	if r.logger == nil {
+		return
+	}
+
+	missing := r.missingNodesLocked()
+	elapsed := r.closedAt.Sub(r.startedAt)
+	r.logger.Printf("[INFO] serf: query completed: id=%d expected=%d acks=%d responses=%d missing=%d elapsed=%s missing_nodes=%v",
+		r.id, len(r.expectedNodes), len(r.acks), len(r.responses), len(missing), elapsed, missing)
+
+	for _, node := range r.expectedNodes {
+		timing, ok := r.timings[node]
+		if !ok {
+			r.logger.Printf("[DEBUG] serf: query node timing: id=%d node=%s acked=false responded=false", r.id, node)
+			continue
+		}
+		r.logger.Printf("[DEBUG] serf: query node timing: id=%d node=%s acked=%v ack_latency=%s responded=%v response_latency=%s",
+			r.id, node, timing.Acked, timing.AckLatency, timing.Responded, timing.ResponseLatency)
+	}
 }
 
 // NodeResponse is used to represent a single response from a node
@@ -254,6 +414,41 @@ func (s *Serf) shouldProcessQuery(filters [][]byte) bool {
 
 		default:
 			s.logger.Printf("[WARN] serf: query has unrecognized filter type: %d", filter[0])
+			return false
+		}
+	}
+	return true
+}
+
+// expectedQueryNodes returns the sorted names of alive members that are
+// expected to answer the given query based on its filters. It is a best
+// effort snapshot taken at dispatch time; members that join afterwards are
+// still able to reply but are not reported as missing if they do not.
+func (s *Serf) expectedQueryNodes(params *QueryParam) []string {
+	members := s.Members()
+	expected := make([]string, 0, len(members))
+	for _, member := range members {
+		if member.Status != StatusAlive {
+			continue
+		}
+		if s.memberMatchesQueryFilters(member, params) {
+			expected = append(expected, member.Name)
+		}
+	}
+	sort.Strings(expected)
+	return expected
+}
+
+// memberMatchesQueryFilters reports whether a member would process a query
+// configured with the given parameters. It mirrors the filter logic applied
+// by the receiving node in shouldProcessQuery.
+func (s *Serf) memberMatchesQueryFilters(member Member, params *QueryParam) bool {
+	if len(params.FilterNodes) > 0 && !slices.Contains(params.FilterNodes, member.Name) {
+		return false
+	}
+	for tag, expr := range params.FilterTags {
+		matched, err := regexp.MatchString(expr, member.Tags[tag])
+		if err != nil || !matched {
 			return false
 		}
 	}

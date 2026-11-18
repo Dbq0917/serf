@@ -2,6 +2,7 @@
 
 IMPROVEMENTS:
 * ValidateNodeName flag can now restrict node names to alphanumeric, -, and . while also keeping node names under 128 characters. Verification of IP Address and tags occur for messages. [GH-612](https://github.com/hashicorp/serf/pull/612)
+* Queries now return partial results with an explicit missing-node list instead of letting callers mistake timed-out members for a smaller cluster. `QueryResponse` gains additive `ExpectedNodes`, `MissingNodes`, `NodeTimings`, and `Elapsed` methods; query completion logs an auditable summary with per-node latencies and emits `serf.query.missing_nodes`, `serf.query.duration`, and `serf.query.incomplete` metrics. Existing query channels, RPC messages, and return structures are unchanged.
 
 ## 0.8.4 (September 19, 2019)
 

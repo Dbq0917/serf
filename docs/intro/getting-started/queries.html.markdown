@@ -87,3 +87,30 @@ Custom queries come with some trade-offs, however:
   within a single UDP packet (alongside any other data Serf sends). This
   limits the potential size of a payload to less than 1 KB.
 
+## Partial Results and Missing Nodes
+
+When a query reaches its timeout, some nodes may not have replied yet. Rather
+than failing the whole query, Serf keeps the responses already received and
+makes the gap explicit so that callers never mistake a partial answer for the
+full cluster. The query timeout itself bounds how long a caller waits.
+
+The Go API exposes this through additive methods on `serf.QueryResponse`; the
+existing `AckCh`, `ResponseCh`, and their streamed message formats are
+unchanged:
+
+* `ExpectedNodes() []string` - snapshot of the members expected to answer when
+  the query was dispatched, including any node and tag filters applied.
+* `MissingNodes() []string` - expected members from which no response (or ack,
+  for ack-only queries) arrived before the timeout. An empty slice means the
+  query completed fully.
+* `NodeTimings() []serf.NodeTiming` - per-node ack and response latency measured
+  from the start of the query, making slow members directly identifiable.
+* `Elapsed() time.Duration` - total wall-clock duration of the query once it has
+  finished.
+
+When a query closes, Serf also emits an auditable log line recording the
+expected, acknowledged, responded, and missing counts together with the missing
+node names and the elapsed time, plus per-node timing records at debug level.
+Metrics are emitted as `serf.query.missing_nodes`, `serf.query.duration`, and
+the `serf.query.incomplete` counter so partial results can be alerted on.
+

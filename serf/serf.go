@@ -579,7 +579,7 @@ func (s *Serf) Query(name string, payload []byte, params *QueryParam) (*QueryRes
 	}
 
 	// Register QueryResponse to track acks and responses
-	resp := newQueryResponse(s.memberlist.NumMembers(), &q)
+	resp := newQueryResponse(s.memberlist.NumMembers(), &q, s.expectedQueryNodes(params), s.logger)
 	s.registerQueryResponse(params.Timeout, resp)
 
 	// Process query locally
@@ -607,7 +607,20 @@ func (s *Serf) registerQueryResponse(timeout time.Duration, resp *QueryResponse)
 		s.queryLock.Lock()
 		delete(s.queryResponse, resp.lTime)
 		resp.Close()
+		missing := len(resp.MissingNodes())
+		elapsed := resp.Elapsed()
 		s.queryLock.Unlock()
+
+		// Record the query outcome so dashboards can alert on partial
+		// results and slow nodes instead of silently accepting them.
+		labels := make([]metrics.Label, 0, len(s.metricLabels)+1)
+		labels = append(labels, s.metricLabels...)
+		labels = append(labels, metrics.Label{Name: "complete", Value: strconv.FormatBool(missing == 0)})
+		metrics.SetGaugeWithLabels([]string{"serf", "query", "missing_nodes"}, float32(missing), labels)
+		metrics.AddSampleWithLabels([]string{"serf", "query", "duration"}, float32(elapsed.Milliseconds()), s.metricLabels)
+		if missing > 0 {
+			metrics.IncrCounterWithLabels([]string{"serf", "query", "incomplete"}, 1, s.metricLabels)
+		}
 	})
 }
 
