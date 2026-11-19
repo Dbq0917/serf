@@ -79,6 +79,28 @@ TESTEVENTLOOP:
 
 }
 
+// countUserEvents returns the number of buffered UserEvent values in ch
+// without consuming them, so it is safe to call repeatedly while polling.
+// Non-user events are ignored.
+func countUserEvents(ch chan Event) int {
+	events := make([]Event, 0, len(ch))
+	for {
+		select {
+		case e := <-ch:
+			events = append(events, e)
+		default:
+			count := 0
+			for _, e := range events {
+				if _, ok := e.(UserEvent); ok {
+					count++
+				}
+				ch <- e
+			}
+			return count
+		}
+	}
+}
+
 // testQueryEvents tests that the given sequence of queries
 // on the event channel took place.
 func testQueryEvents(t *testing.T, ch <-chan Event, expectedName []string, expectedPayload [][]byte) {

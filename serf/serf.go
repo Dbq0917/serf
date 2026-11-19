@@ -98,7 +98,12 @@ type Serf struct {
 	shutdownCh chan struct{}
 
 	snapshotter *Snapshotter
-	keyManager  *KeyManager
+
+	// eventSequenceStore durably tracks the highest observed user-event
+	// Lamport time so that replayed events can be dropped after a restart.
+	// It is optional and only set when EventSequencePath is configured.
+	eventSequenceStore *EventSequenceStore
+	keyManager         *KeyManager
 
 	coordClient    *coordinate.Client
 	coordCache     map[string]*coordinate.Coordinate
@@ -348,6 +353,24 @@ func Create(conf *Config) (*Serf, error) {
 		serf.queryMinTime = oldQueryClock + 1
 	}
 
+	// Restore the durable user-event sequence, if configured. This makes
+	// event de-duplication survive a restart even without a full snapshot:
+	// events replayed with a Lamport time at or below the persisted value
+	// are treated as duplicates instead of new events.
+	var persistedEventClock LamportTime
+	if conf.EventSequencePath != "" {
+		store, lastEventTime, err := newEventSequenceStore(
+			conf.EventSequencePath, &serf.eventClock, serf.logger)
+		if err != nil {
+			return nil, fmt.Errorf("Failed to setup event sequence store: %v", err)
+		}
+		serf.eventSequenceStore = store
+		persistedEventClock = lastEventTime
+		if minTime := lastEventTime + 1; minTime > serf.eventMinTime {
+			serf.eventMinTime = minTime
+		}
+	}
+
 	// Set up the coordinate cache. We do this after we read the snapshot to
 	// make sure we get a good initial value from there, if we got one.
 	if !conf.DisableCoordinates {
@@ -387,6 +410,10 @@ func Create(conf *Config) (*Serf, error) {
 	serf.clock.Witness(oldClock)
 	serf.eventClock.Witness(oldEventClock)
 	serf.queryClock.Witness(oldQueryClock)
+
+	// Restore the durable event clock independently of the snapshot so
+	// that locally generated events keep moving forward after a restart.
+	serf.eventClock.Witness(persistedEventClock)
 
 	// Modify the memberlist configuration with keys that we set
 	conf.MemberlistConfig.Events = &eventDelegate{serf: serf}
@@ -880,6 +907,12 @@ func (s *Serf) Shutdown() error {
 	}
 	close(s.shutdownCh)
 
+	// Flush the durable event sequence before returning so that the next
+	// process starts with the highest event time we have observed.
+	if s.eventSequenceStore != nil {
+		s.eventSequenceStore.Shutdown()
+	}
+
 	// Wait for the snapshoter to finish if we have one
 	if s.snapshotter != nil {
 		s.snapshotter.Wait()
@@ -1308,6 +1341,13 @@ func (s *Serf) handleUserEvent(eventMsg *messageUserEvent) bool {
 			Payload:  eventMsg.Payload,
 			Coalesce: eventMsg.CC,
 		}
+	}
+
+	// Record the newly observed event time durably. This is a non-blocking
+	// hand-off to a background goroutine: the broadcast path never performs
+	// disk I/O or takes an additional lock here.
+	if s.eventSequenceStore != nil {
+		s.eventSequenceStore.Observe()
 	}
 	return true
 }

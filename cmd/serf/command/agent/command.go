@@ -84,6 +84,7 @@ func (c *Command) readConfig() *Config {
 		"address to bind RPC listener to")
 	cmdFlags.StringVar(&cmdConfig.Profile, "profile", "", "timing profile to use (lan, wan, local)")
 	cmdFlags.StringVar(&cmdConfig.SnapshotPath, "snapshot", "", "path to the snapshot file")
+	cmdFlags.StringVar(&cmdConfig.EventSequencePath, "event-sequence", "", "path to the durable user-event sequence file")
 	cmdFlags.Var((*AppendSliceValue)(&tags), "tag",
 		"tag pair, specified as key=value")
 	cmdFlags.StringVar(&cmdConfig.Discover, "discover", "", "mDNS discovery name")
@@ -346,6 +347,7 @@ func (c *Command) setupAgent(config *Config, logOutput io.Writer) *Agent {
 	serfConfig.NodeName = config.NodeName
 	serfConfig.Tags = config.Tags
 	serfConfig.SnapshotPath = config.SnapshotPath
+	serfConfig.EventSequencePath = config.EventSequencePath
 	serfConfig.ProtocolVersion = uint8(config.Protocol)
 	serfConfig.CoalescePeriod = 3 * time.Second
 	serfConfig.QuiescentPeriod = time.Second
@@ -495,6 +497,7 @@ func (c *Command) startAgent(config *Config, agent *Agent,
 	c.Ui.Info(fmt.Sprintf("                   RPC addr: '%s'", config.RPCAddr))
 	c.Ui.Info(fmt.Sprintf("                  Encrypted: %#v", agent.serf.EncryptionEnabled()))
 	c.Ui.Info(fmt.Sprintf("                   Snapshot: %v", config.SnapshotPath != ""))
+	c.Ui.Info(fmt.Sprintf("           Event Sequence: %v", config.EventSequencePath != ""))
 	c.Ui.Info(fmt.Sprintf("                    Profile: %s", config.Profile))
 	c.Ui.Info(fmt.Sprintf("Message Compression Enabled: %v", config.EnableCompression))
 

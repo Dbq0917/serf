@@ -171,6 +171,13 @@ The options below are all specified on the command-line.
   when starting. This flag allows the snapshot state to be used to rejoin
   the cluster.
 
+* `-event-sequence` - Provides a file path used to durably record the highest
+  user-event Lamport time this agent has observed. Unlike `-snapshot` it stores
+  only the event sequence and no node state. After a restart, user events that
+  are replayed with an older sequence are recognized as duplicates and are not
+  delivered again, so downstream event counters are not double counted. Writes
+  are asynchronous and do not add a lock to the gossip/broadcast path.
+
 * `-tag` - The tag flag is used to associate a new key/value pair with the
   agent. The tags are gossiped and can be used to provide additional information
   such as roles, ports, and configuration values to other nodes. Multiple tags
@@ -263,6 +270,8 @@ at a single JSON object with configuration within it.
 * `replay_on_join` - Equivalent to the `-replay` command-line flag.
 
 * `snapshot_path` - Equivalent to the `-snapshot` command-line flag.
+
+* `event_sequence_path` - Equivalent to the `-event-sequence` command-line flag.
 
 * `leave_on_terminate` - If enabled, when the agent receives a TERM signal,
   it will send a Leave message to the rest of the cluster and gracefully

@@ -150,6 +150,11 @@ type Config struct {
 	// re-joining a cluster on failure and avoids old message replay.
 	SnapshotPath string `mapstructure:"snapshot_path"`
 
+	// EventSequencePath is used to durably record the highest user-event
+	// Lamport time so that events replayed after a restart are recognized as
+	// duplicates and not delivered again.
+	EventSequencePath string `mapstructure:"event_sequence_path"`
+
 	// LeaveOnTerm controls if Serf does a graceful leave when receiving
 	// the TERM signal. Defaults false. This can be changed on reload.
 	LeaveOnTerm bool `mapstructure:"leave_on_terminate"`
@@ -438,6 +443,9 @@ func MergeConfig(a, b *Config) *Config {
 	}
 	if b.SnapshotPath != "" {
 		result.SnapshotPath = b.SnapshotPath
+	}
+	if b.EventSequencePath != "" {
+		result.EventSequencePath = b.EventSequencePath
 	}
 	if b.LeaveOnTerm {
 		result.LeaveOnTerm = true

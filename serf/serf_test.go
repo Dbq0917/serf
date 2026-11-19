@@ -532,6 +532,116 @@ func TestSerf_eventsUser(t *testing.T) {
 		[][]byte{[]byte("test"), []byte("foobar")})
 }
 
+// TestSerf_eventsUser_restartDedup verifies that user events replayed after
+// a node restart are not delivered a second time when the event sequence is
+// persisted. The downstream counter must count each event exactly once.
+func TestSerf_eventsUser_restartDedup(t *testing.T) {
+	td := t.TempDir()
+
+	ip1, returnFn1 := testutil.TakeIP()
+	defer returnFn1()
+
+	ip2, returnFn2 := testutil.TakeIP()
+	defer returnFn2()
+
+	s1Config := testConfig(t, ip1)
+	s2Config := testConfig(t, ip2)
+
+	// The restarting node (s2) durably records the event sequence.
+	s2Config.EventSequencePath = td + "/event-seq"
+
+	// Count the user events delivered to the restarting node.
+	eventCh := make(chan Event, 256)
+	s2Config.EventCh = eventCh
+
+	s1, err := Create(s1Config)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	defer s1.Shutdown()
+
+	s2, err := Create(s2Config)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	waitUntilNumNodes(t, 1, s1, s2)
+
+	_, err = s1.Join([]string{s2Config.NodeName + "/" + s2Config.MemberlistConfig.BindAddr}, false)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	waitUntilNumNodes(t, 2, s1, s2)
+
+	// Fire events before the restart.
+	const preRestartEvents = 5
+	for i := 0; i < preRestartEvents; i++ {
+		if err := s1.UserEvent(fmt.Sprintf("event-%d", i), []byte("test"), false); err != nil {
+			t.Fatalf("err: %v", err)
+		}
+	}
+
+	// Wait until s2 has delivered every pre-restart event exactly once.
+	retry.Run(t, func(r *retry.R) {
+		if got := countUserEvents(eventCh); got != preRestartEvents {
+			r.Fatalf("expected %d pre-restart events, got %d", preRestartEvents, got)
+		}
+	})
+
+	// Restart s2 from the persisted event sequence. A clean shutdown flushes
+	// the highest observed event time to disk.
+	if err := s2.Shutdown(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	s2Config = testConfig(t, ip2)
+	s2Config.EventSequencePath = td + "/event-seq"
+	restartCh := make(chan Event, 256)
+	s2Config.EventCh = restartCh
+
+	s2, err = Create(s2Config)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	defer s2.Shutdown()
+
+	// Rejoin the cluster; push/pull and gossip will replay the old events.
+	_, err = s1.Join([]string{s2Config.NodeName + "/" + s2Config.MemberlistConfig.BindAddr}, false)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	waitUntilNumNodes(t, 2, s1, s2)
+
+	// Replayed (pre-restart) events arrive during the rejoin; poll for a
+	// bounded window and assert none of them leak through as deliveries.
+	replayDeadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(replayDeadline) {
+		if got := countUserEvents(restartCh); got != 0 {
+			t.Fatalf("replayed events must be filtered after restart, got %d duplicate deliveries", got)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// A genuinely new event after the restart must still be delivered once.
+	if err := s1.UserEvent("event-after-restart", []byte("fresh"), false); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	retry.Run(t, func(r *retry.R) {
+		if got := countUserEvents(restartCh); got != 1 {
+			r.Fatalf("expected the new post-restart event once, got %d", got)
+		}
+	})
+
+	// No further duplicate may show up after the new event settled.
+	settleDeadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(settleDeadline) {
+		if got := countUserEvents(restartCh); got != 1 {
+			t.Fatalf("expected no additional events, got %d", got)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestSerf_eventsUser_sizeLimit(t *testing.T) {
 	ip1, returnFn1 := testutil.TakeIP()
 	defer returnFn1()

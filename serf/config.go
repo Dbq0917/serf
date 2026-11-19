@@ -217,6 +217,15 @@ type Config struct {
 	// succeeds and will also avoid replaying old user events.
 	SnapshotPath string
 
+	// EventSequencePath if provided is used to durably record the highest
+	// user-event Lamport time this node has observed. Unlike SnapshotPath it
+	// only persists the event sequence and does not record any node state.
+	// It allows user events that are replayed after a restart to be
+	// recognized as duplicates and dropped, even when no snapshot is
+	// configured. Persistence is asynchronous and does not add a lock to
+	// the broadcast path.
+	EventSequencePath string
+
 	// RejoinAfterLeave controls our interaction with the snapshot file.
 	// When set to false (default), a leave causes a Serf to not rejoin
 	// the cluster until an explicit join is received. If this is set to
