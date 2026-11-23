@@ -13,6 +13,8 @@ import (
 	"github.com/hashicorp/memberlist"
 )
 
+const defaultEventBufferMax = 65536
+
 // ProtocolVersionMap is the mapping of Serf delegate protocol versions
 // to memberlist protocol versions. We mask the memberlist protocols using
 // our own protocol version.
@@ -159,6 +161,15 @@ type Config struct {
 	// buffer gets overrun and messages are not delivered.
 	EventBuffer int
 
+	// EventBufferMax is the maximum number of user event messages retained
+	// for nodes that need to catch up after being offline. Unlike EventBuffer,
+	// which is the small recent-window used for duplicate detection, this
+	// history is allowed to grow so a returning node can replay the events it
+	// missed. It is still bounded by a message count so memory usage cannot
+	// grow without limit; once the limit is reached, the oldest messages are
+	// discarded. If this is less than EventBuffer, EventBuffer is used.
+	EventBufferMax int
+
 	// QueryBuffer is used to control how many queries are buffered.
 	// This is used to prevent re-delivery of queries to a client. The buffer
 	// must be large enough to handle all "recent" events, since Serf will not
@@ -289,6 +300,17 @@ func (c *Config) Init() {
 	}
 }
 
+func (c *Config) eventBufferLimit() int {
+	limit := c.EventBufferMax
+	if limit == 0 {
+		limit = defaultEventBufferMax
+	}
+	if limit < c.EventBuffer {
+		limit = c.EventBuffer
+	}
+	return limit
+}
+
 // DefaultConfig returns a Config struct that contains reasonable defaults
 // for most of the configurations.
 func DefaultConfig() *Config {
@@ -302,6 +324,7 @@ func DefaultConfig() *Config {
 		BroadcastTimeout:             5 * time.Second,
 		LeavePropagateDelay:          1 * time.Second,
 		EventBuffer:                  512,
+		EventBufferMax:               defaultEventBufferMax,
 		QueryBuffer:                  512,
 		LogOutput:                    os.Stderr,
 		ProtocolVersion:              4,

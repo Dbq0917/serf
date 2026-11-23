@@ -185,7 +185,7 @@ func (d *delegate) LocalState(join bool) []byte {
 		StatusLTimes: make(map[string]LamportTime, len(d.serf.members)),
 		LeftMembers:  make([]string, 0, len(d.serf.leftMembers)),
 		EventLTime:   d.serf.eventClock.Time(),
-		Events:       d.serf.eventBuffer,
+		Events:       d.serf.localEventState(),
 		QueryLTime:   d.serf.queryClock.Time(),
 	}
 
@@ -294,7 +294,7 @@ func (d *delegate) MergeRemoteState(buf []byte, isJoin bool) {
 		for _, e := range events.Events {
 			userEvent.Name = e.Name
 			userEvent.Payload = e.Payload
-			d.serf.handleUserEvent(&userEvent)
+			d.serf.handleUserEventFromState(&userEvent)
 		}
 	}
 }

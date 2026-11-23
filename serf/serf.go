@@ -5,6 +5,7 @@ package serf
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -81,6 +82,7 @@ type Serf struct {
 
 	eventBroadcasts *memberlist.TransmitLimitedQueue
 	eventBuffer     []*userEvents
+	eventHistory    *userEventHistory
 	eventJoinIgnore atomic.Value
 	eventMinTime    LamportTime
 	eventLock       sync.RWMutex
@@ -221,6 +223,98 @@ func (ue *userEvent) Equals(other *userEvent) bool {
 type userEvents struct {
 	LTime  LamportTime
 	Events []userEvent
+}
+
+// userEventHistory stores user events in Lamport-time order so that a node
+// returning from an outage can receive the events it missed. The history is
+// bounded by a message count to keep memory usage finite.
+type userEventHistory struct {
+	events []*userEvents
+	byTime map[LamportTime]*userEvents
+	limit  int
+	size   int
+}
+
+func newUserEventHistory(limit int) *userEventHistory {
+	if limit < 0 {
+		limit = 0
+	}
+	return &userEventHistory{
+		byTime: make(map[LamportTime]*userEvents),
+		limit:  limit,
+	}
+}
+
+func (h *userEventHistory) lookup(ltime LamportTime) *userEvents {
+	if h == nil {
+		return nil
+	}
+	return h.byTime[ltime]
+}
+
+func (h *userEventHistory) appendEvent(ltime LamportTime, event userEvent) (*userEvents, bool) {
+	if h == nil {
+		return nil, false
+	}
+	if h.limit == 0 {
+		return nil, false
+	}
+
+	events := h.byTime[ltime]
+	if events == nil {
+		events = &userEvents{LTime: ltime}
+		idx, found := slices.BinarySearchFunc(h.events, ltime, func(item *userEvents, target LamportTime) int {
+			return cmp.Compare(item.LTime, target)
+		})
+		if found {
+			events = h.events[idx]
+		} else {
+			h.events = slices.Insert(h.events, idx, events)
+			h.byTime[ltime] = events
+		}
+	}
+
+	events.Events = append(events.Events, event)
+	h.size++
+	h.prune()
+	return events, h.byTime[ltime] == events
+}
+
+func (h *userEventHistory) prune() {
+	if h == nil {
+		return
+	}
+	for h.size > h.limit {
+		oldest := h.events[0]
+		oldest.Events[0] = userEvent{}
+		oldest.Events = oldest.Events[1:]
+		h.size--
+		if len(oldest.Events) == 0 {
+			h.events[0] = nil
+			h.events = h.events[1:]
+			delete(h.byTime, oldest.LTime)
+		}
+	}
+}
+
+func (h *userEventHistory) snapshot() []*userEvents {
+	if h == nil {
+		return nil
+	}
+	return append([]*userEvents(nil), h.events...)
+}
+
+// fitsRecentBuffer reports whether the history can be represented by the
+// recent-event ring. This preserves the wire format used by older nodes while
+// the history fits in the same window.
+func (h *userEventHistory) fitsRecentBuffer(size int) bool {
+	if h == nil || size <= 0 || len(h.events) > size {
+		return false
+	}
+	if len(h.events) < 2 {
+		return true
+	}
+	return h.events[len(h.events)-1].LTime-h.events[0].LTime < LamportTime(size)
 }
 
 // queries stores all the query ids at a specific time
@@ -375,6 +469,7 @@ func Create(conf *Config) (*Serf, error) {
 
 	// Create a buffer for events and queries
 	serf.eventBuffer = make([]*userEvents, conf.EventBuffer)
+	serf.eventHistory = newUserEventHistory(conf.eventBufferLimit())
 	serf.queryBuffer = make([]*queries, conf.QueryBuffer)
 
 	// Ensure our lamport clock is at least 1, so that the default
@@ -1253,9 +1348,34 @@ func (s *Serf) handleNodeJoinIntent(joinMsg *messageJoin) bool {
 	return true
 }
 
+// localEventState returns the events to include in a push/pull exchange.
+// When the bounded history fits in the recent ring we preserve the old wire
+// representation, otherwise we send the full ordered history.
+func (s *Serf) localEventState() []*userEvents {
+	if s.eventHistory != nil && s.eventHistory.fitsRecentBuffer(len(s.eventBuffer)) {
+		return append([]*userEvents(nil), s.eventBuffer...)
+	}
+	if s.eventHistory == nil {
+		return append([]*userEvents(nil), s.eventBuffer...)
+	}
+	return s.eventHistory.snapshot()
+}
+
 // handleUserEvent is called when a user event broadcast is
 // received. Returns if the message should be rebroadcast.
 func (s *Serf) handleUserEvent(eventMsg *messageUserEvent) bool {
+	return s.handleUserEventWithOptions(eventMsg, false)
+}
+
+// handleUserEventFromState processes an event received as part of a push/pull
+// state exchange. Such events may legitimately be older than the recent-event
+// ring when this node is catching up after an outage, so they are checked
+// against eventMinTime and de-duplicated, but not against the recent ring.
+func (s *Serf) handleUserEventFromState(eventMsg *messageUserEvent) bool {
+	return s.handleUserEventWithOptions(eventMsg, true)
+}
+
+func (s *Serf) handleUserEventWithOptions(eventMsg *messageUserEvent, fromState bool) bool {
 	// Witness a potentially newer time
 	s.eventClock.Witness(eventMsg.LTime)
 
@@ -1267,9 +1387,16 @@ func (s *Serf) handleUserEvent(eventMsg *messageUserEvent) bool {
 		return false
 	}
 
-	// Check if this message is too old
+	if s.eventHistory == nil {
+		s.eventHistory = newUserEventHistory(s.config.eventBufferLimit())
+	}
+
+	// Check if this message is too old. Events replayed during a state
+	// exchange may be older than the recent ring, but still need to be
+	// delivered so the node can catch up.
 	curTime := s.eventClock.Time()
-	if curTime > LamportTime(len(s.eventBuffer)) &&
+	if !fromState && len(s.eventBuffer) > 0 &&
+		curTime > LamportTime(len(s.eventBuffer)) &&
 		eventMsg.LTime < curTime-LamportTime(len(s.eventBuffer)) {
 		s.logger.Printf(
 			"[WARN] serf: received old event %s from time %d (current: %d)",
@@ -1279,23 +1406,31 @@ func (s *Serf) handleUserEvent(eventMsg *messageUserEvent) bool {
 		return false
 	}
 
-	// Check if we've already seen this
-	idx := eventMsg.LTime % LamportTime(len(s.eventBuffer))
-	seen := s.eventBuffer[idx]
 	userEvent := userEvent{Name: eventMsg.Name, Payload: eventMsg.Payload}
-	if seen != nil && seen.LTime == eventMsg.LTime {
-		for _, previous := range seen.Events {
+	historic := s.eventHistory.lookup(eventMsg.LTime)
+	if historic != nil {
+		for _, previous := range historic.Events {
 			if previous.Equals(&userEvent) {
 				return false
 			}
 		}
-	} else {
-		seen = &userEvents{LTime: eventMsg.LTime}
-		s.eventBuffer[idx] = seen
+	}
+	var retained bool
+	historic, retained = s.eventHistory.appendEvent(eventMsg.LTime, userEvent)
+	if !retained {
+		return false
 	}
 
-	// Add to recent events
-	seen.Events = append(seen.Events, userEvent)
+	// Keep the recent ring in sync for older nodes and for fast duplicate
+	// checks. Do not let an older backfilled event replace a newer event
+	// that happens to hash to the same slot.
+	if len(s.eventBuffer) > 0 {
+		idx := eventMsg.LTime % LamportTime(len(s.eventBuffer))
+		seen := s.eventBuffer[idx]
+		if seen == nil || seen.LTime <= eventMsg.LTime {
+			s.eventBuffer[idx] = historic
+		}
+	}
 
 	// Update some metrics
 	metrics.IncrCounterWithLabels([]string{"serf", "events"}, 1, s.metricLabels)
