@@ -2,6 +2,7 @@
 
 IMPROVEMENTS:
 * ValidateNodeName flag can now restrict node names to alphanumeric, -, and . while also keeping node names under 128 characters. Verification of IP Address and tags occur for messages. [GH-612](https://github.com/hashicorp/serf/pull/612)
+* query: Queries are now sent directly to all matching members in parallel instead of waiting for gossip propagation. Responses are streamed with bounded memory, and a query closes as soon as every expected member has responded.
 
 ## 0.8.4 (September 19, 2019)
 

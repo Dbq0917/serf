@@ -60,30 +60,30 @@ you'd like; it is up to the event handler to use it in some meaningful way.
 
 ## Limitations
 
-Custom queries are delivered using the Serf gossip layer. The benefits of
-this approach is that you get completely decentralized messaging across
-your entire cluster that is fault tolerant.
+Custom queries are sent directly from the originator to every matching member
+in parallel. Each member sends its response directly back to the originator.
+This avoids waiting for gossip retransmissions, so a large cluster can complete
+a query in roughly one request/response round trip. The trade-off is that the
+originating node sends one packet per matching member.
 
-Due to the mechanics of gossip, custom queries are highly scalable: Serf doesn't
-need to connect to each and every node to send the message, it only needs to connect
-to a handful, regardless of cluster size. It does require that all responses are
-sent directly to the originator, which can be an issue if many nodes are responding.
+Responses are streamed to the caller with a bounded amount of buffering rather
+than being collected into a per-member queue. The query closes as soon as every
+expected member has responded, or when its timeout is reached.
 
 Custom queries come with some trade-offs, however:
 
-* Queries may not be delivered to all nodes: Because events are delivered over
-  gossip, the message arrives at every node unless there is a network partition.
-  Queries are designed for real-time use cases, and because responses to old queries
-  are not useful, Serf will not attempt to redeliver queries to nodes that were
-  offline or could not be reached. This is a critical distinction from custom events,
-  which do attempt a later delivery.
+* Queries may not be delivered to all nodes: They are sent directly to the
+  members known at dispatch time. Queries are designed for real-time use cases,
+  and because responses to old queries are not useful, Serf will not attempt to
+  redeliver queries to nodes that were offline or could not be reached. This is
+  a critical distinction from custom events, which do attempt a later delivery.
 
 * Responses and acknowledgements are sent over UDP back to the query originator.
   Since UDP does not provide any of the reliability or retry mechanisms of TCP,
   this means that although a query handler may be invoked, the response may
   not be received due to network issues.
 
-* Payload size is limited: Serf gossips via UDP, so the payload must fit
-  within a single UDP packet (alongside any other data Serf sends). This
-  limits the potential size of a payload to less than 1 KB.
+* Payload size is limited: Queries and responses are sent over UDP, so each
+  payload must fit within a single UDP packet (alongside any other data Serf
+  sends). This limits the potential size of a payload to less than 1 KB.
 

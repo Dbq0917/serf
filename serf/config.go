@@ -173,7 +173,8 @@ type Config struct {
 	// fashion, however the query must have a bounded duration. We want the timeout
 	// to be long enough that all nodes have time to receive the message, run a handler,
 	// and generate a reply. Once the timeout is exceeded, any further replies are ignored.
-	// The default value is
+	// The default value is an upper bound; queries with complete replies close
+	// as soon as every expected member has responded.
 	//
 	// Timeout = GossipInterval * QueryTimeoutMult * log(N+1)
 	//

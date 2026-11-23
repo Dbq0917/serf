@@ -89,6 +89,55 @@ func (q *QueryParam) encodeFilters() ([][]byte, error) {
 	return filters, nil
 }
 
+// expectedQueryNodes returns the live members that match the query filters.
+// The snapshot is used to decide when a query has collected every response
+// and to avoid sending the query to members the filters exclude.
+func (s *Serf) expectedQueryNodes(params *QueryParam) []string {
+	nodeFilter := make(map[string]struct{}, len(params.FilterNodes))
+	for _, node := range params.FilterNodes {
+		nodeFilter[node] = struct{}{}
+	}
+
+	type tagFilter struct {
+		tag string
+		re  *regexp.Regexp
+	}
+	tagFilters := make([]tagFilter, 0, len(params.FilterTags))
+	for tag, expr := range params.FilterTags {
+		re, err := regexp.Compile(expr)
+		if err != nil {
+			// An invalid expression matches no nodes on the remote side.
+			return nil
+		}
+		tagFilters = append(tagFilters, tagFilter{tag: tag, re: re})
+	}
+
+	members := s.Members()
+	expected := make([]string, 0, len(members))
+	for _, member := range members {
+		if member.Status != StatusAlive {
+			continue
+		}
+		if len(nodeFilter) > 0 {
+			if _, ok := nodeFilter[member.Name]; !ok {
+				continue
+			}
+		}
+
+		matches := true
+		for _, filter := range tagFilters {
+			if !filter.re.MatchString(member.Tags[filter.tag]) {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			expected = append(expected, member.Name)
+		}
+	}
+	return expected
+}
+
 // QueryResponse is returned for each new Query. It is used to collect
 // Ack's as well as responses and to provide those back to a client.
 type QueryResponse struct {
@@ -111,20 +160,65 @@ type QueryResponse struct {
 	acks      map[string]struct{}
 	responses map[string]struct{}
 
+	// expected is the set of members that should answer this query based on
+	// the filters in effect when it was dispatched. respondedExpected lets the
+	// response close as soon as every expected member has replied instead of
+	// always waiting for the full timeout.
+	expectedSet       bool
+	expected          map[string]struct{}
+	respondedExpected int
+
+	// finish deregisters the query and stops its timeout timer.
+	finish func()
+
+	// completionTimer closes the query shortly after every expected reply has
+	// arrived, leaving callers a brief window to drain both result channels.
+	completionTimer *time.Timer
+
+	// done releases a response delivery blocked on a slow consumer when the
+	// query finishes.
+	done chan struct{}
+
+	// responseWG ensures the response channel is only closed after every
+	// in-flight delivery has returned.
+	responseWG sync.WaitGroup
+
 	closed    bool
 	closeLock sync.Mutex
 }
 
+const queryCompletionGrace = 10 * time.Millisecond
+
 // newQueryResponse is used to construct a new query response
 func newQueryResponse(n int, q *messageQuery) *QueryResponse {
+	resp := newQueryResponseInternal(n, q, nil, false)
+	// Preserve the non-blocking delivery contract used by internal callers
+	// that construct a response without an expected-member set.
+	resp.respCh = make(chan NodeResponse, 1)
+	return resp
+}
+
+func newQueryResponseWithExpected(n int, q *messageQuery, expected []string) *QueryResponse {
+	return newQueryResponseInternal(n, q, expected, true)
+}
+
+func newQueryResponseInternal(n int, q *messageQuery, expected []string, expectedSet bool) *QueryResponse {
 	resp := &QueryResponse{
-		deadline:  time.Now().Add(q.Timeout),
-		id:        q.ID,
-		lTime:     q.LTime,
-		respCh:    make(chan NodeResponse, n),
-		responses: make(map[string]struct{}),
+		deadline:    time.Now().Add(q.Timeout),
+		id:          q.ID,
+		lTime:       q.LTime,
+		respCh:      make(chan NodeResponse),
+		responses:   make(map[string]struct{}),
+		expectedSet: expectedSet,
+		expected:    make(map[string]struct{}, len(expected)),
+		done:        make(chan struct{}),
+	}
+	for _, node := range expected {
+		resp.expected[node] = struct{}{}
 	}
 	if q.Ack() {
+		// Acks only hold node names, so keeping one slot per known member is
+		// cheap and lets completion account for every expected ack.
 		resp.ackCh = make(chan string, n)
 		resp.acks = make(map[string]struct{})
 	}
@@ -135,16 +229,32 @@ func newQueryResponse(n int, q *messageQuery) *QueryResponse {
 // channels and prevent further deliveries
 func (r *QueryResponse) Close() {
 	r.closeLock.Lock()
-	defer r.closeLock.Unlock()
 	if r.closed {
+		r.closeLock.Unlock()
 		return
 	}
+	if r.completionTimer != nil {
+		r.completionTimer.Stop()
+	}
 	r.closed = true
+	close(r.done)
+	finish := r.finish
+	r.closeLock.Unlock()
+
+	// Wait for in-flight response delivers before closing the channels.
+	r.responseWG.Wait()
+
+	r.closeLock.Lock()
 	if r.ackCh != nil {
 		close(r.ackCh)
 	}
 	if r.respCh != nil {
 		close(r.respCh)
+	}
+	r.closeLock.Unlock()
+
+	if finish != nil {
+		finish()
 	}
 }
 
@@ -160,6 +270,46 @@ func (r *QueryResponse) Finished() bool {
 	return r.closed || time.Now().After(r.deadline)
 }
 
+func (r *QueryResponse) hasAck(node string) bool {
+	r.closeLock.Lock()
+	defer r.closeLock.Unlock()
+	_, ok := r.acks[node]
+	return ok
+}
+
+func (r *QueryResponse) hasResponse(node string) bool {
+	r.closeLock.Lock()
+	defer r.closeLock.Unlock()
+	_, ok := r.responses[node]
+	return ok
+}
+
+// setFinish installs the deregistration callback used by Close.
+func (r *QueryResponse) setFinish(finish func()) {
+	r.closeLock.Lock()
+	if r.closed {
+		r.closeLock.Unlock()
+		finish()
+		return
+	}
+	r.finish = finish
+	r.closeLock.Unlock()
+}
+
+// completeIfDone schedules the query to close once every expected member has
+// responded. The short grace period lets acks already in flight reach callers.
+func (r *QueryResponse) completeIfDone() {
+	r.closeLock.Lock()
+	defer r.closeLock.Unlock()
+	if !r.expectedSet || r.closed || r.completionTimer != nil {
+		return
+	}
+	if r.respondedExpected < len(r.expected) {
+		return
+	}
+	r.completionTimer = time.AfterFunc(queryCompletionGrace, r.Close)
+}
+
 // AckCh returns a channel that can be used to listen for acks
 // Channel will be closed when the query is finished. This is nil,
 // if the query did not specify RequestAck.
@@ -168,6 +318,8 @@ func (r *QueryResponse) AckCh() <-chan string {
 }
 
 // ResponseCh returns a channel that can be used to listen for responses.
+// Responses are delivered with backpressure to keep memory bounded, so callers
+// should continue receiving until the channel is closed.
 // Channel will be closed when the query is finished.
 func (r *QueryResponse) ResponseCh() <-chan NodeResponse {
 	return r.respCh
@@ -176,24 +328,39 @@ func (r *QueryResponse) ResponseCh() <-chan NodeResponse {
 // sendResponse sends a response on the response channel ensuring the channel is not closed.
 func (r *QueryResponse) sendResponse(nr NodeResponse) error {
 	r.closeLock.Lock()
-	defer r.closeLock.Unlock()
 	if r.closed {
+		r.closeLock.Unlock()
 		return nil
 	}
+	if _, ok := r.responses[nr.From]; ok {
+		r.closeLock.Unlock()
+		return nil
+	}
+	r.responses[nr.From] = struct{}{}
+	if _, ok := r.expected[nr.From]; ok {
+		r.respondedExpected++
+	}
+	r.responseWG.Add(1)
+	respCh := r.respCh
+	done := r.done
+	r.closeLock.Unlock()
+
+	defer r.responseWG.Done()
 	select {
-	case r.respCh <- nr:
-		r.responses[nr.From] = struct{}{}
-	default:
-		return errors.New("serf: Failed to deliver query response, dropping")
+	case respCh <- nr:
+	case <-done:
 	}
 	return nil
 }
 
-// sendResponse sends a response on the response channel ensuring the channel is not closed.
+// sendAck sends an ack on the ack channel ensuring the channel is not closed.
 func (r *QueryResponse) sendAck(nr *messageQueryResponse) error {
 	r.closeLock.Lock()
 	defer r.closeLock.Unlock()
 	if r.closed {
+		return nil
+	}
+	if _, ok := r.acks[nr.From]; ok {
 		return nil
 	}
 	select {

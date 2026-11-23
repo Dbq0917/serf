@@ -520,7 +520,7 @@ func (s *Serf) UserEvent(name string, payload []byte, coalesce bool) error {
 	return nil
 }
 
-// Query is used to broadcast a new query. The query must be fairly small,
+// Query is used to send a new query to every matching member. The query must be fairly small,
 // and an error will be returned if the size limit is exceeded. This is only
 // available with protocol version 4 and newer. Query parameters are optional,
 // and if not provided, a sane set of defaults will be used.
@@ -546,8 +546,9 @@ func (s *Serf) Query(name string, payload []byte, params *QueryParam) (*QueryRes
 		return nil, fmt.Errorf("Failed to format filters: %v", err)
 	}
 
-	// Setup the flags
-	var flags uint32
+	// Deliver directly to every known member instead of relying on gossip.
+	// The no-broadcast flag prevents recipients from re-flooding the query.
+	flags := uint32(queryFlagNoBroadcast)
 	if params.RequestAck {
 		flags |= queryFlagAck
 	}
@@ -579,34 +580,87 @@ func (s *Serf) Query(name string, payload []byte, params *QueryParam) (*QueryRes
 	}
 
 	// Register QueryResponse to track acks and responses
-	resp := newQueryResponse(s.memberlist.NumMembers(), &q)
+	expected := s.expectedQueryNodes(params)
+	resp := newQueryResponseWithExpected(s.memberlist.NumMembers(), &q, expected)
 	s.registerQueryResponse(params.Timeout, resp)
 
 	// Process query locally
 	s.handleQuery(&q)
 
-	// Start broadcasting the event
-	s.queryBroadcasts.QueueBroadcast(&broadcast{
-		msg: raw,
-	})
+	// If filters exclude every member there is nothing to wait for.
+	if len(expected) == 0 {
+		resp.Close()
+		return resp, nil
+	}
+
+	// Fan the query out in parallel. Each recipient replies directly to us,
+	// so the query latency is one request/response round trip rather than the
+	// number of gossip intervals needed to reach every member.
+	go s.fanoutQuery(raw, local.Name, expected)
 	return resp, nil
+}
+
+// fanoutQuery sends the encoded query directly to every other known member.
+// Sends are bounded so a large cluster does not create an unbounded number of
+// goroutines or copies of the query packet.
+func (s *Serf) fanoutQuery(raw []byte, localName string, expected []string) {
+	const maxInFlight = 32
+
+	targets := make(map[string]struct{}, len(expected))
+	for _, node := range expected {
+		targets[node] = struct{}{}
+	}
+
+	sem := make(chan struct{}, maxInFlight)
+	var wg sync.WaitGroup
+	for _, member := range s.memberlist.Members() {
+		if member.Name == localName {
+			continue
+		}
+		if _, ok := targets[member.Name]; !ok {
+			continue
+		}
+
+		select {
+		case sem <- struct{}{}:
+		case <-s.shutdownCh:
+			wg.Wait()
+			return
+		}
+
+		wg.Add(1)
+		go func(member *memberlist.Node) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			if err := s.memberlist.SendBestEffort(member, raw); err != nil {
+				s.logger.Printf("[WARN] serf: failed to send query to %s: %v", member.Name, err)
+			}
+		}(member)
+	}
+	wg.Wait()
 }
 
 // registerQueryResponse is used to setup the listeners for the query,
 // and to schedule closing the query after the timeout.
 func (s *Serf) registerQueryResponse(timeout time.Duration, resp *QueryResponse) {
 	s.queryLock.Lock()
-	defer s.queryLock.Unlock()
 
 	// Map the LTime to the QueryResponse. This is necessarily 1-to-1,
 	// since we increment the time for each new query.
 	s.queryResponse[resp.lTime] = resp
+	s.queryLock.Unlock()
 
 	// Setup a timer to close the response and deregister after the timeout
-	time.AfterFunc(timeout, func() {
-		s.queryLock.Lock()
-		delete(s.queryResponse, resp.lTime)
+	timer := time.AfterFunc(timeout, func() {
 		resp.Close()
+	})
+	resp.setFinish(func() {
+		timer.Stop()
+		s.queryLock.Lock()
+		if s.queryResponse[resp.lTime] == resp {
+			delete(s.queryResponse, resp.lTime)
+		}
 		s.queryLock.Unlock()
 	})
 }
@@ -1439,7 +1493,7 @@ func (s *Serf) handleQueryResponse(resp *messageQueryResponse) {
 	// Process each type of response
 	if resp.Ack() {
 		// Exit early if this is a duplicate ack
-		if _, ok := query.acks[resp.From]; ok {
+		if query.hasAck(resp.From) {
 			metrics.IncrCounterWithLabels([]string{"serf", "query_duplicate_acks"}, 1, s.metricLabels)
 			return
 		}
@@ -1449,9 +1503,10 @@ func (s *Serf) handleQueryResponse(resp *messageQueryResponse) {
 		if err != nil {
 			s.logger.Printf("[WARN] %v", err)
 		}
+		query.completeIfDone()
 	} else {
 		// Exit early if this is a duplicate response
-		if _, ok := query.responses[resp.From]; ok {
+		if query.hasResponse(resp.From) {
 			metrics.IncrCounterWithLabels([]string{"serf", "query_duplicate_responses"}, 1, s.metricLabels)
 			return
 		}
@@ -1461,6 +1516,7 @@ func (s *Serf) handleQueryResponse(resp *messageQueryResponse) {
 		if err != nil {
 			s.logger.Printf("[WARN] %v", err)
 		}
+		query.completeIfDone()
 	}
 }
 

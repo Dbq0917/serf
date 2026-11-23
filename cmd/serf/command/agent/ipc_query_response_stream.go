@@ -34,24 +34,37 @@ func (qs *queryResponseStream) Stream(resp *serf.QueryResponse) {
 
 	ackCh := resp.AckCh()
 	respCh := resp.ResponseCh()
-	for {
+	for ackCh != nil || respCh != nil {
 		select {
-		case a := <-ackCh:
+		case a, ok := <-ackCh:
+			if !ok {
+				ackCh = nil
+				continue
+			}
 			if err := qs.sendAck(a); err != nil {
 				qs.logger.Printf("[ERR] agent.ipc: Failed to stream ack to %v: %v", qs.client, err)
 				return
 			}
-		case r := <-respCh:
+		case r, ok := <-respCh:
+			if !ok {
+				respCh = nil
+				continue
+			}
 			if err := qs.sendResponse(r.From, r.Payload); err != nil {
 				qs.logger.Printf("[ERR] agent.ipc: Failed to stream response to %v: %v", qs.client, err)
 				return
 			}
 		case <-done:
-			if err := qs.sendDone(); err != nil {
-				qs.logger.Printf("[ERR] agent.ipc: Failed to stream query end to %v: %v", qs.client, err)
-			}
+			sendDone(qs)
 			return
 		}
+	}
+	sendDone(qs)
+}
+
+func sendDone(qs *queryResponseStream) {
+	if err := qs.sendDone(); err != nil {
+		qs.logger.Printf("[ERR] agent.ipc: Failed to stream query end to %v: %v", qs.client, err)
 	}
 }
 

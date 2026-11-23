@@ -3,7 +3,7 @@ layout: "docs"
 page_title: "Commands: Query"
 sidebar_current: "docs-commands-query"
 description: |-
-  The `serf query` command dispatches a custom user query into a Serf cluster, efficiently broadcasting the query to all nodes, and gathering responses.
+  The `serf query` command dispatches a custom user query to all matching nodes in parallel and gathers responses.
 ---
 
 # Serf Query
@@ -11,15 +11,16 @@ description: |-
 Command: `serf query`
 
 The `serf query` command dispatches a custom user query into a Serf cluster,
-efficiently broadcasting the query to all nodes, and gathering responses.
+sending it directly to all matching nodes in parallel and gathering responses.
 
 Nodes in the cluster can listen for queries and respond to them.
 Example use cases of queries are to request load average, ask for the
 version of an app that is deployed, or to trigger deploys across web nodes
 by sending a "deploy" query, possibly with a commit payload.
 
-The command will wait until the query finishes (by reaching a timeout) and
-will report all acknowledgements and responses that are received.
+The command will finish as soon as every expected node has responded, or when
+the query timeout is reached, and will report all acknowledgements and
+responses that were received.
 
 The open ended nature of `serf query` allows you to send and respond to
 queries in _any way_ you want.
@@ -63,11 +64,8 @@ The command-line flags are all optional. The list of available flags are:
   multiple times to filter on multiple keys.
 
 * `-timeout=15s` - When provided, the given timeout overrides the default query timeout.
-  By default, a query has a timeout that is designed to give the cluster enough time
-  to gossip the message out and to respond. This is a computed multiple of the
-  GossipInterval, a QueryTimeoutMultipler and a logarithmic scale based on cluster size.
-  This time may be low for long running queries, so this flag can be used to specify
-  an alternative timeout.
+  The query still completes early when all expected nodes have replied. This flag is
+  useful when query handlers need more time than the default permits.
 
 * `-rpc-addr` - Address to the RPC server of the agent you want to contact
   to send this command. If this isn't specified, the command will contact
